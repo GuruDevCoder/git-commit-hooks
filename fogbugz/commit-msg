@@ -1,0 +1,193 @@
+#!/usr/bin/env python
+#
+
+import os, sys, re, urllib2
+from fogbugz import FogBugz
+
+FOGBUGZ_URL = 'https://workshare.fogbugz.com'
+
+#
+# Support functions
+#
+
+PATTERN_SQUARES = re.compile(r'\[([0-9]+)\]')
+PATTERN_CASE_HH = re.compile(r'case\#([0-9]+)')
+PATTERN_CASE_CO = re.compile(r'case\:([0-9]+)')
+
+def process(num, line):
+    if line.startswith('#'):
+        return []
+
+    cases = []
+    cases = cases + PATTERN_SQUARES.findall(line)
+    cases = cases + PATTERN_CASE_HH.findall(line)
+    cases = cases + PATTERN_CASE_CO.findall(line)
+    return cases
+
+def sysexit(message, success):
+    print "> "
+    print "> "+message
+    print
+
+    exitcode = (0 if success else 1)
+    sys.exit(exitcode)
+
+#
+# Simple class to encapsulate an issue
+#
+class Issue: 
+    def __init__(self, case):
+        self.title = case.stitle.string.encode('UTF-8')
+        self.iden = case.ixbug.string.encode('UTF-8')
+        self.open = bool(case.fopen.string == 'true')
+
+    def iden(self):
+        return self.iden
+
+    def title(self):
+        return self.title
+
+    def is_open(self):
+        return self.open
+
+    def url(self):
+        return FOGBUGZ_URL+"/default.asp?"+self.iden
+    
+    def __str__(self):
+        return "case "+self.iden+", "+("OPEN" if self.open else "CLOSED")+" - "+self.title
+     
+     
+#
+# Simple facade for fogbugz
+#
+class Fogz:
+    def __init__(self, token):
+        self.fb = FogBugz(FOGBUGZ_URL, token)
+    
+    def query(self, cases):
+        query = "" 
+        for case in cases:
+            if len(query) > 0:
+                query += ","
+            query += case
+
+        response = self.fb.search(q=query,type="case",cols="ixBug,sTitle,fOpen") 
+        
+        issues = []
+        for case in response.cases:
+            issue = Issue(case)
+            issues.append(issue)
+    
+        return issues
+
+    def dispose(self):
+        self._kill_token()
+
+#
+# Token management
+#
+
+def read_token():
+    tokenfile = _token_file()
+    token = None
+    if os.path.exists(tokenfile):
+        with open(tokenfile, 'r') as f:
+            token = f.readline()  
+
+    if token == None:
+        raise Exception("Token not found, please run the setup - see https://workshare.fogbugz.com/default.asp?W497")
+    return token
+
+def create_token(email, password):
+    res = urllib2.urlopen(FOGBUGZ_URL+"/api.asp?cmd=logon&email="+email+"&password="+password).read()
+    pattern = re.compile(r'CDATA\[([a-zA-Z0-9]+)\]')
+    try:
+        token = pattern.findall(res)[0]
+        _write_token(token)
+        return token
+    except Exception as ex:
+        print "> Error accessing fogbugz: "+res
+        return None
+
+def _write_token(token):
+    tokenfile = _token_file()
+    with open(tokenfile, 'w') as f:
+        f.write(token)
+
+def _token_file():
+    home = os.path.expanduser("~")
+    folder = os.path.join( home, '.fogbugz' )
+    if not os.path.exists(folder):
+        os.makedirs(folder)
+    return os.path.join( folder, 'token.txt' )
+
+def _kill_token():
+    tokenfile = _token_file()
+    os.remove(tokenfile)
+
+
+#
+# Entry point
+#
+if len(sys.argv) == 1:
+    sysexit("FAILED - If you want to run the setup please specify \"setup your-email your-password\"", False)
+
+
+# check if setup requested
+if "setup" == sys.argv[1]:
+    email = sys.argv[2]
+    passw = sys.argv[3]
+    token = create_token(email, passw)
+    if token == None:
+        sysexit("FAILED - Setup was unsuccessful", True)
+    else:
+        sysexit("SUCCESS - Setup completed", True)
+
+# collects issues from commit file
+cases = []
+message = ""
+message_file = sys.argv[1]
+with open(message_file) as fd:
+    num = 1
+    lines = fd.read().splitlines()
+    for line in lines:
+        cases = cases + process(num, line)
+        message = message + line
+	num = num +1
+print
+print "> FOGBUGZ commit hook  === c/o Workshare Ltd ==="
+print "> "
+if message.find("NOFOGZ") != -1:
+    sysexit("BYPASSED - NOFOGZ specified!", True)
+	
+print "> Detected cases "+str(cases)
+if len(cases) == 0:
+    sysexit("FAILED - No issues were referenced in this commit!", False)
+
+# check issue status on fogbugz
+fogz = None
+try:
+    fogz = Fogz(read_token())
+    print "> Checking cases..."
+
+    all_open = True
+    issues = fogz.query(cases)
+    for issue in issues:
+        print ">  "+str(issue)
+        if issue.is_open() == False:
+            all_open = False
+
+    if len(issues) != len(cases):
+        sysexit("FAILED - Some issues referenced in this commit were not found!", False)
+  
+    if all_open == False:
+        sysexit("FAILED - Some issues referenced in this commit are closed!", False)
+  
+except Exception as ex:
+    if fogz != None: 
+        fogz.dispose();
+
+    sysexit("FAILED - Temporarily unable to connect to fogbugz: "+str(ex), False)
+
+sysexit("SUCCESS - Commit accepted!", True)
+
